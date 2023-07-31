@@ -122,6 +122,10 @@ struct ScreenRecorder {
             configuration.height = Int(displaySize.height) * displayScaleFactor
         }
 
+        // Set color space and matrix to sRGB
+        configuration.colorSpaceName = CGColorSpace.sRGB
+        configuration.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+
         // Create SCStream and add local StreamOutput object to receive samples
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try stream.addStreamOutput(streamOutput, type: .screen, sampleHandlerQueue: videoSampleBufferQueue)
