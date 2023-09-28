@@ -7,7 +7,19 @@
 import AVFoundation
 import CoreGraphics
 import ScreenCaptureKit
+import VideoToolbox
 
+enum RecordMode {
+    case h264_sRGB
+    case hevc_displayP3
+
+    // I haven't gotten HDR recording working yet.
+    // The commented out code is my best attempt, but still results in "blown out whites".
+    //
+    // Any tips are welcome!
+    // - Tom
+//    case hevc_displayP3_HDR
+}
 
 // Create a screen recording
 do {
@@ -18,7 +30,7 @@ do {
 
     let url = URL(filePath: FileManager.default.currentDirectoryPath).appending(path: "recording \(Date()).mov")
 //    let cropRect = CGRect(x: 0, y: 0, width: 960, height: 540)
-    let screenRecorder = try await ScreenRecorder(url: url, displayID: CGMainDisplayID(), cropRect: nil)
+    let screenRecorder = try await ScreenRecorder(url: url, displayID: CGMainDisplayID(), cropRect: nil, mode: .h264_sRGB)
 
     print("Starting screen recording of main display")
     try await screenRecorder.start()
@@ -43,11 +55,10 @@ struct ScreenRecorder {
     private let streamOutput: StreamOutput
     private var stream: SCStream
 
-    init(url: URL, displayID: CGDirectDisplayID, cropRect: CGRect?) async throws {
+    init(url: URL, displayID: CGDirectDisplayID, cropRect: CGRect?, mode: RecordMode) async throws {
 
         // Create AVAssetWriter for a QuickTime movie file
         self.assetWriter = try AVAssetWriter(url: url, fileType: .mov)
-
 
         // MARK: AVAssetWriter setup
 
@@ -65,20 +76,28 @@ struct ScreenRecorder {
 
         // AVAssetWriterInput supports maximum resolution of 4096x2304 for H.264
         // Downsize to fit a larger display back into in 4K
-        let videoSize = downsizedVideoSize(source: cropRect?.size ?? displaySize, scaleFactor: displayScaleFactor)
+        let videoSize = downsizedVideoSize(source: cropRect?.size ?? displaySize, scaleFactor: displayScaleFactor, mode: mode)
 
-        // This preset is the maximum H.264 preset, at the time of writing this code
-        // Make this as large as possible, size will be reduced to screen size by computed videoSize
-        guard let assistant = AVOutputSettingsAssistant(preset: .preset3840x2160) else {
-            throw RecordingError("Can't create AVOutputSettingsAssistant with .preset3840x2160")
+        // Use the preset as large as possible, size will be reduced to screen size by computed videoSize
+        guard let assistant = AVOutputSettingsAssistant(preset: mode.preset) else {
+            throw RecordingError("Can't create AVOutputSettingsAssistant")
         }
-        assistant.sourceVideoFormat = try CMVideoFormatDescription(videoCodecType: .h264, width: videoSize.width, height: videoSize.height)
+        assistant.sourceVideoFormat = try CMVideoFormatDescription(videoCodecType: mode.videoCodecType, width: videoSize.width, height: videoSize.height)
 
         guard var outputSettings = assistant.videoSettings else {
             throw RecordingError("AVOutputSettingsAssistant has no videoSettings")
         }
         outputSettings[AVVideoWidthKey] = videoSize.width
         outputSettings[AVVideoHeightKey] = videoSize.height
+
+        // Configure video color properties and compression properties based on RecordMode
+        // See AVVideoSettings.h and VTCompressionProperties.h
+        outputSettings[AVVideoColorPropertiesKey] = mode.videoColorProperties
+        if let videoProfileLevel = mode.videoProfileLevel {
+            var compressionProperties: [String: Any] = outputSettings[AVVideoCompressionPropertiesKey] as? [String: Any] ?? [:]
+            compressionProperties[AVVideoProfileLevelKey] = videoProfileLevel
+            outputSettings[AVVideoCompressionPropertiesKey] = compressionProperties as NSDictionary
+        }
 
         // Create AVAssetWriter input for video, based on the output settings from the Assistant
         videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
@@ -108,7 +127,10 @@ struct ScreenRecorder {
         let filter = SCContentFilter(display: display, excludingWindows: [])
 
         let configuration = SCStreamConfiguration()
-        configuration.queueDepth = 6
+
+        // Increase the depth of the frame queue to ensure high fps at the expense of increasing
+        // the memory footprint of WindowServer.
+        configuration.queueDepth = 6 // 4 minimum, or it becomes very stuttery
 
         // Make sure to take displayScaleFactor into account
         // otherwise, image is scaled up and gets blurry
@@ -122,9 +144,18 @@ struct ScreenRecorder {
             configuration.height = Int(displaySize.height) * displayScaleFactor
         }
 
-        // Set color space and matrix to sRGB
-        configuration.colorSpaceName = CGColorSpace.sRGB
-        configuration.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+        // Set pixel format an color space, see CVPixelBuffer.h
+        switch mode {
+        case .h264_sRGB:
+            configuration.pixelFormat = kCVPixelFormatType_32BGRA // 'BGRA'
+            configuration.colorSpaceName = CGColorSpace.sRGB
+        case .hevc_displayP3:
+            configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked // 'l10r'
+            configuration.colorSpaceName = CGColorSpace.displayP3
+//        case .hevc_displayP3_HDR:
+//            configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked // 'l10r'
+//            configuration.colorSpaceName = CGColorSpace.displayP3
+        }
 
         // Create SCStream and add local StreamOutput object to receive samples
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
@@ -237,8 +268,8 @@ struct ScreenRecorder {
 
 
 // AVAssetWriterInput supports maximum resolution of 4096x2304 for H.264
-private func downsizedVideoSize(source: CGSize, scaleFactor: Int) -> (width: Int, height: Int) {
-    let maxSize = CGSize(width: 4096, height: 2304)
+private func downsizedVideoSize(source: CGSize, scaleFactor: Int, mode: RecordMode) -> (width: Int, height: Int) {
+    let maxSize = mode.maxSize
 
     let w = source.width * Double(scaleFactor)
     let h = source.height * Double(scaleFactor)
@@ -252,4 +283,65 @@ private func downsizedVideoSize(source: CGSize, scaleFactor: Int) -> (width: Int
 struct RecordingError: Error, CustomDebugStringConvertible {
     var debugDescription: String
     init(_ debugDescription: String) { self.debugDescription = debugDescription }
+}
+
+// Extension properties for values that differ per record mode
+extension RecordMode {
+    var preset: AVOutputSettingsPreset {
+        switch self {
+        case .h264_sRGB: return .preset3840x2160
+        case .hevc_displayP3: return .hevc7680x4320
+//        case .hevc_displayP3_HDR: return .hevc7680x4320
+        }
+    }
+
+    var maxSize: CGSize {
+        switch self {
+        case .h264_sRGB: return CGSize(width: 4096, height: 2304)
+        case .hevc_displayP3: return CGSize(width: 7680, height: 4320)
+//        case .hevc_displayP3_HDR: return CGSize(width: 7680, height: 4320)
+        }
+    }
+
+    var videoCodecType: CMFormatDescription.MediaSubType {
+        switch self {
+        case .h264_sRGB: return .h264
+        case .hevc_displayP3: return .hevc
+//        case .hevc_displayP3_HDR: return .hevc
+        }
+    }
+
+    var videoColorProperties: NSDictionary {
+        switch self {
+        case .h264_sRGB:
+            return [
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ]
+        case .hevc_displayP3:
+            return [
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_P3_D65,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ]
+//        case .hevc_displayP3_HDR:
+//            return [
+//                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+//                AVVideoColorPrimariesKey: AVVideoColorPrimaries_P3_D65,
+//                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020,
+//            ]
+        }
+    }
+
+    var videoProfileLevel: CFString? {
+        switch self {
+        case .h264_sRGB:
+            return nil
+        case .hevc_displayP3:
+            return nil
+//        case .hevc_displayP3_HDR:
+//            return kVTProfileLevel_HEVC_Main10_AutoLevel
+        }
+    }
 }
